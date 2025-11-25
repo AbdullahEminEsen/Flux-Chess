@@ -1,0 +1,236 @@
+<!doctype html>
+<html lang="tr">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Flux Chess – Online (Client)</title>
+  <script src="https://cdn.socket.io/4.7.2/socket.io.min.js"></script>
+  <style>
+    :root {
+      --bg: #0e0f13; --card:#141a23; --line:#2a2f3a; --muted:#8ea0b6;
+      --light:#2a3242; --dark:#1e2430; --accent:#62d5ff; --danger:#ff6b6b;
+      --hp-bg:#3a4354; --hp-ok:#77e6a0; --hp-mid:#ffd05c; --hp-low:#ff7b7b;
+    }
+    * { box-sizing: border-box; }
+    body { margin:0; background:var(--bg); color:#d7e0ea; font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial; }
+    .wrap { max-width:1060px; margin:20px auto; padding:0 16px; }
+    h1 { margin:0 0 10px; font-size:20px; letter-spacing:.3px; }
+    .row { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+    .card { background:var(--card); border:1px solid var(--line); border-radius:14px; padding:12px; box-shadow:0 12px 30px rgba(0,0,0,.35); }
+    input, button { height:38px; border-radius:10px; border:1px solid var(--line); background:#1b2230; color:#eaf3ff; padding:0 10px; }
+    input::placeholder { color:#8794a7; }
+    button { cursor:pointer; font-weight:600; }
+    button:hover { background:#222a3a; }
+    .muted { color:var(--muted); font-size:12px; }
+    .grid { display:grid; grid-template-columns: 1fr 640px; gap:16px; align-items:start; }
+    canvas { display:block; border-radius:16px; border:1px solid var(--line); background: conic-gradient(from 180deg at 50% 50%, #0d1117, #0d1119, #0d1117); }
+    .status { font-size:14px; line-height:1.5; }
+
+    /* Attack overlay */
+    .attack-overlay { position: fixed; inset: 0; display: none; align-items: center; justify-content: center; background: rgba(5,8,13,.72); z-index: 20; }
+    .attack-overlay.show { display: flex; }
+    .attack-panel { width: 560px; max-width: calc(100% - 32px); background: #0f1320; border: 1px solid #2a2f3a; border-radius: 16px; padding: 18px; box-shadow: 0 18px 40px rgba(0,0,0,.55); text-align: center; }
+    .attack-title { margin: 0 0 12px; font-size: 18px; font-weight: 700; letter-spacing: .4px; }
+    .attack-sub { margin: 4px 0 12px; opacity: .85; font-size: 13px; }
+    .gauge { position: relative; height: 38px; border-radius: 10px; background: #1a2130; border: 1px solid #2f3848; margin: 12px auto; width: 460px; max-width: calc(100% - 24px); overflow: hidden; }
+    .gauge .center { position: absolute; left: 50%; top: 0; bottom: 0; width: 2px; background: #e8eefc33; }
+    .gauge .cursor { position: absolute; top: 2px; bottom: 2px; width: 10px; border-radius: 6px; background: linear-gradient(#a6d7ff, #69bfff); box-shadow: 0 0 12px #62d5ff88; }
+    .legend { font-size:12px; opacity:.85; }
+  </style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Flux Chess – Online (Render)</h1>
+  <div class="card" style="margin-bottom:12px;">
+    <div class="row" style="margin-bottom:8px;">
+      <button id="mkRoom">Oda Oluştur</button>
+      <input id="roomId" placeholder="Room ID" style="width:140px;" />
+      <input id="pin" placeholder="PIN (4)" style="width:100px;"/>
+      <button id="jnRoom">Katıl</button>
+      <span id="roomInfo" class="muted"></span>
+    </div>
+    <div class="status" id="status">Bağlanıyor…</div>
+    <div class="legend">İpucu: Her oyuncu kendi taşlarını <b>altta</b>, rakibi <b>üstte</b> görür. Bir sekmede <b>Oda Oluştur</b>, diğer sekmede <b>Katıl</b> yapıp <b>Room ID + PIN</b> girin. Saldırıda <b>Space</b> → sunucu zamanı ile hasar.</div>
+  </div>
+
+  <div class="grid">
+    <div class="card">
+      <div style="font-size:13px;line-height:1.5;">
+        <b>Kurallar kısa özet</b><br>
+        • Oracle 3 kez art arda → çapraz sınırsız (o Oracle).<br>
+        • Tower kare döngüsü → ortogonal sınırsız (yakalama her zaman açık).<br>
+        • HP/ATK var; saldırı barı ile hasar (sunucu ölçer).<br>
+        • Oda ve 4 haneli PIN ile davet.
+      </div>
+    </div>
+    <canvas id="board" width="640" height="640"></canvas>
+  </div>
+</div>
+
+<!-- Attack Overlay -->
+<div id="attackOverlay" class="attack-overlay" aria-hidden="true">
+  <div class="attack-panel">
+    <div class="attack-title">Saldırı Zamanlaması</div>
+    <div class="attack-sub" id="attackInfo">Space tuşuna merkezde bas → yüksek hasar</div>
+    <div class="gauge"><div class="center"></div><div class="cursor" id="gaugeCursor" style="left:0"></div></div>
+  </div>
+</div>
+
+<script>
+  (function(){
+    // === Socket setup ===
+    const SOCKET_URL = 'https://flux-chess-server.onrender.com'; // Render URL'in
+    const socket = io(SOCKET_URL, { transports:["websocket","polling"] });
+
+    // === Canvas + UI refs ===
+    const canvas = document.getElementById('board');
+    const ctx = canvas.getContext('2d');
+    const statusEl = document.getElementById('status');
+    const mkRoomBtn = document.getElementById('mkRoom');
+    const jnRoomBtn = document.getElementById('jnRoom');
+    const roomIdEl = document.getElementById('roomId');
+    const pinEl = document.getElementById('pin');
+    const roomInfo = document.getElementById('roomInfo');
+    const overlay = document.getElementById('attackOverlay');
+    const gaugeCursor = document.getElementById('gaugeCursor');
+
+    // === Visual constants ===
+    const SIZE=8, TILE=canvas.width/SIZE; // 80
+    const css=v=>getComputedStyle(document.documentElement).getPropertyValue(v).trim();
+    const DARK=css('--dark'), LIGHT=css('--light'), DANGER=css('--danger');
+    const HP_BG=css('--hp-bg'), HP_OK=css('--hp-ok'), HP_MID=css('--hp-mid'), HP_LOW=css('--hp-low');
+
+    // === Local state (server-authoritative) ===
+    let myColor=null; // 'W' | 'B'
+    let state = null; // server state
+    let hover=null, selected=null, legalMovesCache=null; let tAnim=0;
+
+    // === Helpers ===
+    const at=(s,x,y)=> s?.board?.[y]?.[x] || null;
+    const inBounds=(x,y)=> x>=0 && x<SIZE && y>=0 && y<SIZE;
+    const opp=c=> c==='W'?'B':'W';
+
+    // --- Perspective helpers (W: normal, B: 180° döndür) ---
+    function modelToView(x,y){ return myColor==='B' ? {x:7-x, y:7-y} : {x,y}; }
+    function viewToModel(x,y){ return myColor==='B' ? {x:7-x, y:7-y} : {x,y}; }
+
+    // === Legal moves (UX için; sunucu yine doğrular) ===
+    const RIDER_STEPS=[[2,1],[1,2],[2,-1],[1,-2],[-2,1],[-1,2],[-2,-1],[-1,-2],[3,1],[1,3],[3,-1],[1,-3],[-3,1],[-1,3],[-3,-1],[-1,-3]];
+    function legalMovesFor(x,y){
+      const p=at(state,x,y); if(!p) return [];
+      let moves=[]; const add=(nx,ny)=>{ if(!inBounds(nx,ny)) return; const q=at(state,nx,ny); if(!q||q.color!==p.color) moves.push({x:nx,y:ny,kind:q?'capture':'move'}); };
+      if(p.type==='K') for(let dx=-1;dx<=1;dx++) for(let dy=-1;dy<=1;dy++) if(dx||dy) add(x+dx,y+dy);
+      if(p.type==='V'){
+        const dirs=[[1,0],[-1,0],[0,1],[0,-1],[1,1],[-1,1],[1,-1],[-1,-1]]; for(const [dx,dy] of dirs){ for(let s=1;s<=2;s++){ const nx=x+dx*s, ny=y+dy*s; if(!inBounds(nx,ny)) break; const q=at(state,nx,ny); if(!q) moves.push({x:nx,y:ny,kind:'move'}); else { if(q.color!==p.color) moves.push({x:nx,y:ny,kind:'capture'}); break; } } }
+      }
+      if(p.type==='O'){
+        const limit=p.diagUnlimited?8:2; const dirs=[[1,1],[-1,1],[1,-1],[-1,-1]]; for(const [dx,dy] of dirs){ for(let s=1;s<=limit;s++){ const nx=x+dx*s, ny=y+dy*s; if(!inBounds(nx,ny)) break; const q=at(state,nx,ny); if(!q) moves.push({x:nx,y:ny,kind:'move'}); else { if(q.color!==p.color) moves.push({x:nx,y:ny,kind:'capture'}); break; } } }
+      }
+      if(p.type==='R'){ for(const [dx,dy] of RIDER_STEPS){ const nx=x+dx, ny=y+dy; if(inBounds(nx,ny)){ const q=at(state,nx,ny); if(!q||q.color!==p.color) moves.push({x:nx,y:ny,kind:q?'capture':'move'}); } } }
+      if(p.type==='S'){
+        const dir=p.color==='W'?-1:1; for(const dx of [-1,1]){ const nx=x+dx, ny=y+dir; if(inBounds(nx,ny)&&!at(state,nx,ny)) moves.push({x:nx,y:ny,kind:'move'}); }
+        const fx=x, fy=y+dir; if(inBounds(fx,fy)){ const q=at(state,fx,fy); if(q&&q.color!==p.color) moves.push({x:fx,y:fy,kind:'capture'}); }
+      }
+      if(p.type==='T'){
+        const dirs=[[1,0],[-1,0],[0,1],[0,-1]];
+        for(const [dx,dy] of dirs){ const limit=p.orthoUnlimited?8:3; for(let s=1;s<=limit;s++){ const nx=x+dx*s, ny=y+dy*s; if(!inBounds(nx,ny)) break; if(!at(state,nx,ny)) moves.push({x:nx,y:ny,kind:'move'}); else break; } }
+        for(const [dx,dy] of dirs){
+          let cx=x+dx, cy=y+dy; while(inBounds(cx,cy) && !at(state,cx,cy)){ cx+=dx; cy+=dy; }
+          if(!inBounds(cx,cy)) continue; cx+=dx; cy+=dy; while(inBounds(cx,cy) && !at(state,cx,cy)){ cx+=dx; cy+=dy; }
+          if(!inBounds(cx,cy)) continue; const q=at(state,cx,cy); if(q && q.color!==p.color) moves.push({x:cx,y:cy,kind:'capture'});
+        }
+      }
+      return moves;
+    }
+
+    // === Socket wiring ===
+    socket.on('connect', ()=>{ statusEl.textContent = 'Bağlandı: '+SOCKET_URL; });
+    socket.on('disconnect', ()=>{ statusEl.textContent = 'Bağlantı koptu'; });
+
+    mkRoomBtn.onclick = ()=>{
+      socket.emit('create_room', {}, ({roomId,pin,color,error})=>{
+        if(error) return alert(error);
+        myColor=color; roomIdEl.value=roomId; pinEl.value=pin;
+        roomInfo.textContent = `Oda: ${roomId} • PIN: ${pin} • Ben: ${color==='W'?'Beyaz':'Siyah'} (alt hizadan görünüm)`;
+      });
+    };
+    jnRoomBtn.onclick = ()=>{
+      const roomId = roomIdEl.value.trim(); const pin = pinEl.value.trim();
+      socket.emit('join_room', {roomId, pin}, ({color,error})=>{
+        if(error) return alert(error); myColor=color; roomInfo.textContent += ` • Ben: ${color==='W'?'Beyaz':'Siyah'} (alt hizadan görünüm)`;
+      });
+    };
+
+    socket.on('state', (serverState)=>{ state = serverState; selected=null; legalMovesCache=null; updateStatus(); });
+    socket.on('attack_start', ()=>{ overlay.classList.add('show'); animGauge(); });
+
+    function finishAttack(){ socket.emit('attack_commit', {}, (res)=>{ overlay.classList.remove('show'); if(res?.error) alert(res.error); }); }
+    window.addEventListener('keydown', e=>{ if(e.code==='Space' && overlay.classList.contains('show')){ e.preventDefault(); finishAttack(); } });
+
+    // === Board input ===
+    canvas.addEventListener('mousemove', e=>{ const r=canvas.getBoundingClientRect(); const vx=Math.floor((e.clientX-r.left)/TILE), vy=Math.floor((e.clientY-r.top)/TILE); if(vx<0||vy<0||vx>=SIZE||vy>=SIZE) return; const {x,y}=viewToModel(vx,vy); if(inBounds(x,y)){ if(!hover||hover.x!==x||hover.y!==y) hover={x,y}; }});
+    canvas.addEventListener('mouseleave', ()=> hover=null);
+    canvas.addEventListener('click', e=>{
+      if(!state || state.winner) return; const r=canvas.getBoundingClientRect(); const vx=Math.floor((e.clientX-r.left)/TILE), vy=Math.floor((e.clientY-r.top)/TILE); if(vx<0||vy<0||vx>=SIZE||vy>=SIZE) return; const {x,y}=viewToModel(vx,vy);
+      const p = at(state,x,y);
+      // sıra/sahiplik guard (sunucu da kontrol eder)
+      if(p && p.color===state.turn && p.color===myColor){ selected={x,y}; legalMovesCache = legalMovesFor(x,y); return; }
+      if(selected){ const ok = (legalMovesCache||[]).some(m=>m.x===x&&m.y===y); if(!ok) return; const {x:sx,y:sy}=selected;
+        socket.emit('make_move', { from:{x:sx,y:sy}, to:{x,y} }, (res)=>{ if(res?.error) alert(res.error); }); selected=null; legalMovesCache=null; }
+    });
+
+    // === Render loop ===
+    let raf=0; function loop(){ tAnim+=1/60; draw(); raf=requestAnimationFrame(loop); } loop();
+
+    function draw(){
+      // board (model -> view çizim)
+      ctx.clearRect(0,0,canvas.width,canvas.height);
+      for(let my=0; my<SIZE; my++) for(let mx=0; mx<SIZE; mx++){
+        const {x: vx, y: vy} = modelToView(mx,my);
+        const dark=((mx+my)%2)===1; ctx.fillStyle=dark?DARK:LIGHT; ctx.fillRect(vx*TILE, vy*TILE, TILE, TILE);
+      }
+
+      // hover highlight (model coords tutuluyor)
+      if(hover && (!selected || hover.x!==selected.x || hover.y!==selected.y)){
+        const v = modelToView(hover.x, hover.y); ctx.fillStyle='rgba(255,255,255,.08)'; ctx.fillRect(v.x*TILE, v.y*TILE, TILE, TILE);
+      }
+
+      // selected + moves
+      let captureTargets=[]; if(selected){ const vs = modelToView(selected.x, selected.y); ctx.fillStyle='rgba(98,213,255,0.22)'; ctx.fillRect(vs.x*TILE,vs.y*TILE,TILE,TILE); const ms=legalMovesCache||[]; for(const m of ms){ const v=modelToView(m.x,m.y); const cx=v.x*TILE+TILE/2, cy=v.y*TILE+TILE/2; ctx.beginPath(); ctx.arc(cx,cy,10,0,Math.PI*2); ctx.fillStyle=m.kind==='capture'?DANGER:'rgba(255,255,255,.18)'; ctx.fill(); if(m.kind==='capture') captureTargets.push({x:m.x,y:m.y}); } }
+
+      // pieces
+      if(state){ for(let my=0; my<SIZE; my++) for(let mx=0; mx<SIZE; mx++){ const p=at(state,mx,my); if(!p) continue; const v=modelToView(mx,my); drawPiece(p,v.x,v.y); } }
+
+      // capture glow (model -> view)
+      if(captureTargets.length){ const pulse=0.6+0.4*Math.sin(tAnim*4); for(const t of captureTargets){ const v=modelToView(t.x,t.y); const cx=v.x*TILE+TILE/2, cy=v.y*TILE+TILE/2; ctx.beginPath(); ctx.arc(cx,cy,30+4*pulse,0,Math.PI*2); ctx.strokeStyle='rgba(255,107,107,'+(0.35+0.25*pulse)+')'; ctx.lineWidth=4; ctx.stroke(); } }
+    }
+
+    function drawPiece(p,vx,vy){ const cx=vx*TILE+TILE/2, cy=vy*TILE+TILE/2; const grad=ctx.createLinearGradient(cx-26,cy-26,cx+26,cy+26); if(p.color==='W'){ grad.addColorStop(0,'#e9f3ff'); grad.addColorStop(1,'#9fb9ff'); } else { grad.addColorStop(0,'#141a26'); grad.addColorStop(1,'#3f4860'); } ctx.save(); ctx.fillStyle=grad; ctx.strokeStyle=p.color==='W'? '#6fa8ff':'#8bd8ff'; ctx.lineWidth=2; roundedRect(cx-28,cy-28,56,56,12); ctx.fill(); ctx.stroke(); ctx.translate(cx,cy); ctx.strokeStyle=p.color==='W'? '#2b3b66':'#c5e6ff'; ctx.lineWidth=3; ctx.lineJoin='round'; ctx.lineCap='round'; if(p.type==='O' && p.diagUnlimited){ ctx.beginPath(); ctx.arc(0,0,24,0,Math.PI*2); ctx.strokeStyle='#9bf1ffaa'; ctx.lineWidth=2; ctx.stroke(); } if(p.type==='T' && p.orthoUnlimited){ ctx.beginPath(); ctx.rect(-24,-24,48,48); ctx.strokeStyle='#a0ffa9aa'; ctx.lineWidth=2; ctx.stroke(); }
+      switch(p.type){ case 'K': crownIcon(); break; case 'V': vizierIcon(); break; case 'T': towerIcon(); break; case 'O': oracleIcon(); break; case 'R': riderIcon(); break; case 'S': scoutIcon(); break; }
+      ctx.restore();
+      // HP bar
+      const ratio=Math.max(0,(p.hp||1)/(p.maxHp||1)); const color=ratio>0.6?HP_OK:(ratio>0.3?HP_MID:HP_LOW); ctx.fillStyle=HP_BG; ctx.fillRect(vx*TILE+8,vy*TILE+TILE-10,TILE-16,6); ctx.fillStyle=color; ctx.fillRect(vx*TILE+8,vy*TILE+TILE-10,(TILE-16)*ratio,6);
+    }
+
+    function roundedRect(x,y,w,h,r){ ctx.beginPath(); ctx.moveTo(x+r,y); ctx.arcTo(x+w,y,x+w,y+h,r); ctx.arcTo(x+w,y+h,x,y+h,r); ctx.arcTo(x,y+h,x,y,r); ctx.arcTo(x,y,x+w,y,r); ctx.closePath(); }
+    function crownIcon(){ ctx.beginPath(); ctx.moveTo(-18,10); ctx.lineTo(-18,-6); ctx.lineTo(-8,-2); ctx.lineTo(0,-12); ctx.lineTo(8,-2); ctx.lineTo(18,-6); ctx.lineTo(18,10); ctx.moveTo(-18,6); ctx.lineTo(18,6); ctx.stroke(); }
+    function vizierIcon(){ ctx.beginPath(); ctx.moveTo(0,-14); ctx.lineTo(4,-4); ctx.lineTo(14,0); ctx.lineTo(4,4); ctx.lineTo(0,14); ctx.lineTo(-4,4); ctx.lineTo(-14,0); ctx.lineTo(-4,-4); ctx.closePath(); ctx.stroke(); ctx.beginPath(); ctx.arc(0,0,3,0,Math.PI*2); ctx.stroke(); }
+    function towerIcon(){ ctx.beginPath(); ctx.moveTo(-12,12); ctx.lineTo(-12,-8); ctx.lineTo(-6,-8); ctx.lineTo(-6,-14); ctx.lineTo(6,-14); ctx.lineTo(6,-8); ctx.lineTo(12,-8); ctx.lineTo(12,12); ctx.closePath(); ctx.stroke(); ctx.beginPath(); ctx.moveTo(-6,-8); ctx.lineTo(-6,-2); ctx.moveTo(0,-8); ctx.lineTo(0,-2); ctx.moveTo(6,-8); ctx.lineTo(6,-2); ctx.stroke(); }
+    function oracleIcon(){ ctx.beginPath(); ctx.moveTo(-14,0); ctx.quadraticCurveTo(0,-12,14,0); ctx.quadraticCurveTo(0,12,-14,0); ctx.closePath(); ctx.stroke(); ctx.beginPath(); ctx.arc(0,0,4,0,Math.PI*2); ctx.stroke(); }
+    function riderIcon(){ ctx.beginPath(); ctx.moveTo(-12,8); ctx.lineTo(-2,0); ctx.lineTo(6,6); ctx.lineTo(12,-8); ctx.stroke(); ctx.beginPath(); ctx.moveTo(-6,-6); ctx.lineTo(0,-12); ctx.lineTo(8,-8); ctx.stroke(); }
+    function scoutIcon(){ ctx.beginPath(); ctx.moveTo(0,-14); ctx.lineTo(10,6); ctx.lineTo(0,2); ctx.lineTo(-10,6); ctx.closePath(); ctx.stroke(); }
+
+    function updateStatus(){
+      if(!state){ statusEl.textContent='Durum: bekleniyor…'; return; }
+      if(state.winner){ statusEl.innerHTML = `🟢 <b>${state.winner==='W'?'Beyaz':'Siyah'}</b> kazandı.`; return; }
+      const turnTxt = state.turn==='W'?'Beyaz':'Siyah';
+      statusEl.innerHTML = `Sıra: <b>${turnTxt}</b> ${myColor?`• Ben: <b>${myColor==='W'?'Beyaz':'Siyah'}</b> (alt hizadan görünüm)`:''}`;
+    }
+
+    // === Gauge animation (client-side visual only) ===
+    let gaugeRAF=0; function animGauge(){ cancelAnimationFrame(gaugeRAF); const t0=performance.now(); const tick=()=>{ const t=performance.now()-t0; const phase=Math.sin(t*0.005); const w=document.querySelector('.gauge').clientWidth-10; const x=(phase*0.5+0.5)*(w-2)+1; gaugeCursor.style.left=x+'px'; gaugeRAF=requestAnimationFrame(tick); }; tick(); }
+
+  })();
+</script>
+</body>
+</html>
